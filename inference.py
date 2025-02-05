@@ -26,7 +26,7 @@ def predict_and_detect(chosen_model, img, classes=[], conf=0.5, rectangle_thickn
                         cv2.FONT_HERSHEY_PLAIN, 1, color, text_thickness)
     return img, results
 
-model = YOLO("fish1.pt")
+model = YOLO("fish2.pt")
 
 cap = cv2.VideoCapture(0)  # Use webcam
 prev_time = time.time()

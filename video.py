@@ -1,65 +1,177 @@
 import cv2
 import time
+import numpy as np
 from ultralytics import YOLO
+from filterpy.kalman import KalmanFilter
+from collections import deque, Counter
+from concurrent.futures import ThreadPoolExecutor
 
-def predict(chosen_model, img, classes=[], conf=0.5):
-    if classes:
-        results = chosen_model.predict(img, classes=classes, conf=conf)
-    else:
-        results = chosen_model.predict(img, conf=conf)
+# Initialize YOLO model
+model = YOLO("fish3.pt")
 
-    return results
+# Video input
+video_path = "test.mp4"
+cap = cv2.VideoCapture(video_path)
 
-def get_color_for_class(class_id):
-    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
-    return colors[class_id % len(colors)]
+# Screen dimensions
+screen_width = 1080
+screen_height = 720
 
-def predict_and_detect(chosen_model, img, classes=[], conf=0.5, rectangle_thickness=2, text_thickness=1):
-    results = predict(chosen_model, img, classes, conf=conf)
+# Center line for counting
+center_line = screen_width // 2
+
+# Initialize tracking data
+fish_tracks = {}
+fish_counts = {"left": {}, "right": {}}
+fish_history = {}  # To store history of detected fish types
+fish_directions = {}  # To store history of fish directions
+lost_threshold = 50  # Number of frames to keep a track before considering it lost
+
+def create_kalman_filter():
+    kf = KalmanFilter(dim_x=4, dim_z=2)
+    kf.F = np.array([[1, 0, 1, 0],  
+                      [0, 1, 0, 1],  
+                      [0, 0, 1, 0],  
+                      [0, 0, 0, 1]])  # State transition
+    kf.H = np.array([[1, 0, 0, 0],  
+                      [0, 1, 0, 0]])  # Measurement function
+    kf.P *= 1000  # Initial uncertainty
+    kf.R = np.array([[10, 0], [0, 10]])  # Measurement noise
+    kf.Q = np.eye(4) * 0.1  # Process noise
+    return kf
+
+def predict_and_detect(chosen_model, img, conf=0.6, iou=0.6):
+    results = chosen_model.predict(img, conf=conf, iou=iou)
+    detected_fish = []
     for result in results:
         for box in result.boxes:
             class_id = int(box.cls[0])
-            color = get_color_for_class(class_id)
-            confidence = box.conf[0]
-            cv2.rectangle(img, (int(box.xyxy[0][0]), int(box.xyxy[0][1])),
-                          (int(box.xyxy[0][2]), int(box.xyxy[0][3])), color, rectangle_thickness)
-            cv2.putText(img, f"{result.names[class_id]} {confidence:.2f}",
-                        (int(box.xyxy[0][0]), int(box.xyxy[0][1]) - 10),
-                        cv2.FONT_HERSHEY_PLAIN, 1, color, text_thickness)
-    return img, results
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cx = (x1 + x2) // 2  # Fish center x
+            cy = (y1 + y2) // 2  # Fish center y
+            detected_fish.append((cx, cy, class_id))
+    return img, detected_fish
 
-model = YOLO("fish1.pt")
+def update_tracks(detected_fish):
+    updated_tracks = {}
+    for cx, cy, class_id in detected_fish:
+        found_match = False
+        for track_id, (kf, last_class, last_pos, lost_frames) in fish_tracks.items():
+            kf.predict()
+            px, py = kf.x[:2]  # Predicted position
+            if abs(px - cx) < 100 and abs(py - cy) < 100:  # Match detected
+                kf.update([cx, cy])
+                updated_tracks[track_id] = (kf, class_id, (cx, cy), 0)  # Reset lost_frames
+                found_match = True
+                break
+        
+        if not found_match:  # Create new track
+            new_kf = create_kalman_filter()
+            new_kf.x[:2] = np.array([cx, cy]).reshape((2, 1))
+            new_track_id = len(fish_tracks)
+            updated_tracks[new_track_id] = (new_kf, class_id, (cx, cy), 0)  # Initialize lost_frames
+            fish_history[new_track_id] = deque(maxlen=2)  # Initialize history deque with a smaller maxlen
+            fish_directions[new_track_id] = deque(maxlen=2)  # Initialize direction history deque
 
-video_path = r"test.mp4"
-cap = cv2.VideoCapture(video_path)
+    # Handle lost tracks
+    for track_id, (kf, class_id, last_pos, lost_frames) in fish_tracks.items():
+        if track_id not in updated_tracks:
+            if lost_frames < lost_threshold:
+                updated_tracks[track_id] = (kf, class_id, last_pos, lost_frames + 1)
+            else:
+                # Track is considered lost after threshold
+                pass
 
-screen_width = 1280
-screen_height = 720
+    return updated_tracks
+
+def update_fish_history(updated_tracks):
+    for track_id, (kf, class_id, (cx, cy), lost_frames) in updated_tracks.items():
+        fish_history[track_id].append(class_id)
+        most_common_class_id, count = Counter(fish_history[track_id]).most_common(1)[0]
+        if count > len(fish_history[track_id]) // 2:
+            updated_tracks[track_id] = (kf, most_common_class_id, (cx, cy), lost_frames)
+        prev_x, prev_y = fish_tracks.get(track_id, (kf, class_id, (cx, cy), lost_frames))[2]
+        direction = "right" if cx > prev_x else "left"
+        fish_directions[track_id].append(direction)
+
+def count_fish_crossing(updated_tracks):
+    for track_id, (kf, class_id, (cx, cy), lost_frames) in updated_tracks.items():
+        prev_x, prev_y = fish_tracks.get(track_id, (kf, class_id, (cx, cy), lost_frames))[2]
+        if len(fish_directions[track_id]) == fish_directions[track_id].maxlen:
+            consistent_direction = Counter(fish_directions[track_id]).most_common(1)[0][0]
+            if consistent_direction == "right" and prev_x < center_line and cx >= center_line:
+                fish_counts["right"].setdefault(class_id, 0)
+                fish_counts["right"][class_id] += 1
+                print(f"Fish {model.names[class_id]} crossed to the right. Total: {fish_counts['right'][class_id]}")
+            elif consistent_direction == "left" and prev_x > center_line and cx <= center_line:
+                fish_counts["left"].setdefault(class_id, 0)
+                fish_counts["left"][class_id] += 1
+                print(f"Fish {model.names[class_id]} crossed to the left. Total: {fish_counts['left'][class_id]}")
+
+def draw_tracking_info(result_img, updated_tracks):
+    for track_id, (kf, class_id, (cx, cy), lost_frames) in updated_tracks.items():
+        color = (0, 255, 0)
+        cv2.circle(result_img, (cx, cy), 5, color, -1)
+        cv2.putText(result_img, f"ID {track_id} {model.names[class_id]}", (cx, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        px, py = kf.x[:2]
+        cv2.circle(result_img, (int(px), int(py)), 5, (0, 0, 255), -1)  # Red circle for prediction
+
+def draw_center_line(result_img):
+    cv2.line(result_img, (center_line, 0), (center_line, screen_height), (255, 0, 0), 2)
+
+def display_counts(result_img):
+    y_offset = 50
+    for direction, counts in fish_counts.items():
+        for class_id, count in counts.items():
+            text = f"{model.names[class_id]} {direction}: {count}"
+            cv2.putText(result_img, text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            y_offset += 30
+
+def calculate_fps(prev_time):
+    current_time = time.time()
+    fps = 1 / (current_time - prev_time)
+    return fps, current_time
 
 prev_time = 0
 
-while True:
-    success, img = cap.read()
-    if not success:
-        break
-    
-    # Resize the frame to fit the screen
+def process_frame(img):
     img = cv2.resize(img, (screen_width, screen_height))
+    result_img, detected_fish = predict_and_detect(model, img, conf=0.6, iou=0.6)  # Increased thresholds
     
-    result_img, _ = predict_and_detect(model, img, classes=[], conf=0.5)
+    updated_tracks = update_tracks(detected_fish)
+    update_fish_history(updated_tracks)
+    count_fish_crossing(updated_tracks)
     
-    # Calculate FPS
-    current_time = time.time()
-    fps = 1 / (current_time - prev_time)
-    prev_time = current_time
+    global fish_tracks
+    fish_tracks = updated_tracks  # Update the global fish_tracks variable
     
-    # Display FPS on the frame
-    cv2.putText(result_img, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    draw_tracking_info(result_img, updated_tracks)
+    draw_center_line(result_img)
+    display_counts(result_img)
     
-    cv2.imshow("Image", result_img)
-    
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    return result_img
+
+with ThreadPoolExecutor(max_workers=2) as executor:
+    while True:
+        success, img = cap.read()
+        if not success:
+            break
+        
+        future = executor.submit(process_frame, img)
+        result_img = future.result()
+        
+        fps, prev_time = calculate_fps(prev_time)
+        cv2.putText(result_img, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        cv2.imshow("Image", result_img)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
 cap.release()
 cv2.destroyAllWindows()
+
+# Print final counts
+print("Fish counts:")
+for direction, counts in fish_counts.items():
+    for class_id, count in counts.items():
+        print(f"{model.names[class_id]} {direction}: {count}")
