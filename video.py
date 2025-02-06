@@ -1,6 +1,7 @@
 import cv2
 import time
 import numpy as np
+import requests
 from ultralytics import YOLO
 from filterpy.kalman import KalmanFilter
 from collections import deque, Counter
@@ -129,10 +130,12 @@ def count_fish_crossing(updated_tracks):
             if consistent_direction == "right" and prev_x < center_line and cx >= center_line:
                 fish_counts["right"].setdefault(class_id, 0)
                 fish_counts["right"][class_id] += 1
+                requests.get(f"http://127.0.0.1:5000/fish_counts")  # Send update request
                 print(f"Fish {model.names[class_id]} crossed to the right. Total: {fish_counts['right'][class_id]}")
             elif consistent_direction == "left" and prev_x > center_line and cx <= center_line:
                 fish_counts["left"].setdefault(class_id, 0)
                 fish_counts["left"][class_id] += 1
+                requests.get(f"http://127.0.0.1:5000/fish_counts")  # Send update request
                 print(f"Fish {model.names[class_id]} crossed to the left. Total: {fish_counts['left'][class_id]}")
 
 def draw_tracking_info(result_img, updated_tracks):
